@@ -3,12 +3,6 @@ package pilot
 import (
 	"bytes"
 	"fmt"
-	log "github.com/Sirupsen/logrus"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
-	"golang.org/x/net/context"
 	"io"
 	"io/ioutil"
 	"os"
@@ -17,6 +11,15 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
+	"container/list"
+	log "github.com/Sirupsen/logrus"
+	"github.com/AliyunContainerService/fluentd-pilot/wait"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+	"golang.org/x/net/context"
 )
 
 /**
@@ -38,6 +41,7 @@ type Pilot struct {
 	base         string
 	dockerClient *client.Client
 	reloadable   bool
+	list         *list.List
 }
 
 func New(tplStr string, baseDir string) (*Pilot, error) {
@@ -59,16 +63,23 @@ func New(tplStr string, baseDir string) (*Pilot, error) {
 		dockerClient: client,
 		tpl:          tpl,
 		base:         baseDir,
+		list:         list.New(),
 	}, nil
 }
-
-func (p *Pilot) watch() error {
+func (p *Pilot) listRemoveAll() {
+	var n *list.Element
+	for e := p.list.Front(); e != nil; e = n {
+		n = e.Next()
+		p.list.Remove(e)
+	}
+}
+func (p *Pilot) watch(debug bool) error {
 
 	p.reloadable = false
 	if err := p.processAllContainers(); err != nil {
 		return err
 	}
-	StartFluentd()
+	StartFluentd(debug)
 	p.reloadable = true
 
 	ctx := context.Background()
@@ -112,6 +123,9 @@ type LogConfig struct {
 	File         string
 	Tags         map[string]string
 	Target       string
+	TimeKey      string
+	TimeFormat   string
+	HostKey      string
 }
 
 func (p *Pilot) cleanConfigs() error {
@@ -158,6 +172,9 @@ func (p *Pilot) processAllContainers() error {
 	}
 
 	for _, c := range containers {
+		if c.State == "removing" {
+			continue
+		}
 		containerJSON, err := p.client().ContainerInspect(context.Background(), c.ID)
 		if err != nil {
 			return err
@@ -226,7 +243,8 @@ func (p *Pilot) newContainer(containerJSON types.ContainerJSON) error {
 	if err = ioutil.WriteFile(p.pathOf(id), []byte(fluentdConfig), os.FileMode(0644)); err != nil {
 		return err
 	}
-	p.tryReload()
+	//p.tryReload()
+	p.list.PushBack("newContainer")
 	return nil
 }
 
@@ -245,7 +263,8 @@ func (p *Pilot) delContainer(id string) error {
 	if err := os.Remove(p.pathOf(id)); err != nil {
 		return err
 	}
-	p.tryReload()
+	//p.tryReload()
+	p.list.PushBack("remove")
 	return nil
 }
 
@@ -271,14 +290,26 @@ func (p *Pilot) processEvent(msg events.Message) error {
 	case "destroy":
 		log.Debugf("Process container destory event: %s", containerId)
 		p.delContainer(containerId)
+	//case "stop":
+	//	log.Debugf("Process container stop event: %s", containerId)
+	//	p.delContainer(containerId)
 	}
 	return nil
 }
 
 func (p *Pilot) hostDirOf(path string, mounts map[string]types.MountPoint) string {
+	confPath := path
 	for {
 		if point, ok := mounts[path]; ok {
-			return point.Source
+			if confPath == path {
+				return point.Source
+			} else {
+				relPath, err := filepath.Rel(path, confPath)
+				if err != nil {
+					panic(err)
+				}
+				return fmt.Sprintf("%s/%s", point.Source, relPath)
+			}
 		}
 		path = filepath.Dir(path)
 		if path == "/" || path == "." {
@@ -325,6 +356,21 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 
 	target := info.get("target")
 
+	timeKey := info.get("time_key")
+	if timeKey == "" {
+		timeKey = "@timestamp"
+	}
+
+	timeFormat := info.get("time_format")
+	if timeFormat == "" {
+		timeFormat = "%Y-%m-%dT%H:%M:%S.%L"
+	}
+
+	hostKey := info.get("host_key")
+	if hostKey == "" {
+		hostKey = "host"
+	}
+
 	if path == "stdout" {
 		return &LogConfig{
 			Name:         name,
@@ -334,6 +380,9 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 			Tags:         tagMap,
 			FormatConfig: map[string]string{"time_format": "%Y-%m-%dT%H:%M:%S.%NZ"},
 			Target:       target,
+			TimeKey:      timeKey,
+			TimeFormat:   timeFormat,
+			HostKey:      hostKey,
 		}, nil
 	}
 
@@ -376,6 +425,9 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 		HostDir:      filepath.Join(p.base, hostDir),
 		FormatConfig: formatConfig,
 		Target:       target,
+		TimeKey:      timeKey,
+		TimeFormat:   timeFormat,
+		HostKey:      hostKey,
 	}, nil
 }
 
@@ -443,11 +495,47 @@ func (p *Pilot) getLogConfigs(jsonLogPath string, mounts []types.MountPoint, lab
 	}
 
 	for name, node := range root.children {
-		logConfig, err := p.parseLogConfig(name, node, jsonLogPath, mountsMap)
-		if err != nil {
-			return nil, err
+		path := node.value
+		if path != "stdout" && strings.Contains(path, ",") {
+			paths := strings.Split(path, ",")
+
+			hasTags := false
+			childrenTags := ""
+			if node.get("tags") != "" {
+				hasTags = true
+				childrenTags = node.children["tags"].value
+			}
+			for index, v := range paths {
+				tags := fmt.Sprintf("stream=%s", v)
+				vArray := strings.Split(v, ":")
+				if len(vArray) == 2 {
+					v = strings.TrimSpace(vArray[1])
+					tags = fmt.Sprintf("%s=%s", strings.TrimSpace(vArray[0]), v)
+				}
+				if hasTags {
+					node.children["tags"].value = fmt.Sprintf("%s,%s", childrenTags, tags)
+				} else {
+					node.insert([]string{"tags"}, tags)
+				}
+
+				if node.get("target") == "" {
+					node.insert([]string{"target"}, name)
+				}
+
+				node.value = v
+				logConfig, err := p.parseLogConfig(fmt.Sprintf("%s-%d", name, index), node, jsonLogPath, mountsMap)
+				if err != nil {
+					return nil, err
+				}
+				ret = append(ret, logConfig)
+			}
+		} else {
+			logConfig, err := p.parseLogConfig(name, node, jsonLogPath, mountsMap)
+			if err != nil {
+				return nil, err
+			}
+			ret = append(ret, logConfig)
 		}
-		ret = append(ret, logConfig)
 	}
 	return ret, nil
 }
@@ -479,10 +567,22 @@ func (p *Pilot) reload() error {
 	return ReloadFluentd()
 }
 
-func Run(tpl string, baseDir string) error {
+func Run(tpl string, baseDir string, debug bool) error {
 	p, err := New(tpl, baseDir)
 	if err != nil {
 		panic(err)
 	}
-	return p.watch()
+	//开启进程监听是否有重启命令
+	go wait.Until(func() {
+		i := p.list.Back()
+		if i != nil {
+			log.Debugf("list reload:%s", i.Value)
+			p.tryReload()
+			p.listRemoveAll()
+		} else {
+			log.Debugf("list Empty")
+		}
+	}, 10 * time.Second, wait.NeverStop)
+
+	return p.watch(debug)
 }

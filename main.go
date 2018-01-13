@@ -14,6 +14,7 @@ func main() {
 	template := flag.String("template", "", "Template filepath for fluentd.")
 	base := flag.String("base", "", "Directory which mount host root.")
 	level := flag.String("log-level", "INFO", "Log level")
+	debug := flag.Bool("fluetnd-debug", false, "fluetnd Log level")
 	flag.Parse()
 
 	baseDir, err := filepath.Abs(*base)
@@ -41,5 +42,5 @@ func main() {
 		panic(err)
 	}
 
-	log.Fatal(pilot.Run(string(b), baseDir))
+	log.Fatal(pilot.Run(string(b), baseDir,*debug))
 }

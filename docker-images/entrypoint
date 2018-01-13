@@ -1,17 +1,52 @@
-#!/bin/sh
+#!/usr/bin/python
+# coding: utf-8
 
-cd $(dirname $0)
-config=config.default
-if [ -f "config.custom" ]; then
-    config=config.custom
-fi
+import sys
+import os
+import os.path
+import subprocess
+import logging
+import socket
+import re
 
-chmod +x $config
+base = '/host'
 
-if ! sh $config; then
-    echo "failed generate config with $config"
-    exit 1
-fi
 
-/pilot/pilot -base /host -template /pilot/fluentd.tpl -log-level debug
+def umount(volume):
+    try:
+        logging.info('umount : %s', volume)
+        subprocess.check_call('umount %s' % volume, shell=True)
+        # TODO retry
+    except subprocess.CalledProcessError:
+        logging.info('umount : %s error', volume)
 
+
+def cleanup():
+    with open('/proc/mounts', 'r') as f:
+        mounts = f.read().decode('utf-8')
+    umounts = []
+    for line in mounts.split('\n'):
+        ftab = line.split()
+        # if len(ftab) > 1 and ftab[1].startswith(base + '/'):
+        #     umounts.append(ftab[1])
+        if len(ftab) > 1 and (re.search(".*/containers/([0-9A-Za-z]{64})/shm", ftab[1]) or re.search(".*/aufs/mnt/([0-9A-Za-z]{64})", ftab[1]) or re.search(".*/overlay/([0-9A-Za-z]{64})", ftab[1])):
+            umounts.append(ftab[1])
+    for volume in sorted(umounts, reverse=True):
+        umount(volume)
+
+
+def run():
+    args = ['/pilot/pilot', '-template', '/pilot/fluentd.tpl', '-base', base, '-log-level', 'debug']
+    if os.getenv('FLUETND_DEBUG') and os.getenv('FLUETND_DEBUG') == 'true':
+        args.extend(["-fluetnd-debug", "true"])
+    os.execve('/pilot/pilot', args, os.environ)
+
+
+def config():
+    subprocess.check_call(['/pilot/config.default'])
+
+
+if __name__ == '__main__':
+    config()
+    # cleanup()
+    run()
