@@ -4,36 +4,39 @@
   tag docker.{{ $.containerId }}.{{ .Name }}
   path {{ .HostDir }}/{{ .File }}
   format {{ .Format }}
+  read_from_head true
 
-{{if .FormatConfig}}
-{{range $key, $value := .FormatConfig}}
-{{ $key }} {{ $value }}
-{{end}}
-{{end}}
-  pos_file /pilot/pos/fluentd.pos
-  refresh_interval 1
+  {{if .FormatConfig}}
+  {{range $key, $value := .FormatConfig}}
+  {{ $key }} {{ $value }}
+  {{end}}
+  {{end}}
+  pos_file /pilot/pos/{{ $.containerId }}.{{ .Name }}.pos
 </source>
 
 <filter docker.{{ $.containerId }}.{{ .Name }}>
-@type add_time
-time_key @timestamp
+  @type add_time
+  time_key {{ .TimeKey}}
 </filter>
 
-
 <filter docker.{{ $.containerId }}.{{ .Name }}>
-@type record_transformer
-<record>
-host "#{Socket.gethostname}"
-{{range $key, $value := .Tags}}
-{{ $key }} {{ $value }}
-{{end}}
+  @type record_transformer
+  enable_ruby true
+  <record>
+    host "#{Socket.gethostname}"
+    {{range $key, $value := .Tags}}
+    {{ $key }} {{ $value }}
+    {{end}}
 
-@target {{if .Target}}{{.Target}}{{else}}{{ .Name }}{{end}}
+    {{if eq $.fluentdOutput "elasticsearch"}}
+    @target {{if .Target}}{{.Target}}-${time.strftime('%Y.%m.%d')}{{else}}{{ .Name }}-${time.strftime('%Y.%m.%d')}{{end}}
+    {{else}}
+    @target {{if .Target}}{{.Target}}{{else}}{{ .Name }}{{end}}
+    {{end}}
 
-{{if $.source.Application}}docker_app {{ $.source.Application }} {{end}}
-{{if $.source.Service}}docker_service {{ $.source.Service }} {{end}}
-{{if $.source.POD}}k8s_pod {{ $.source.POD }} {{end}}
-{{if $.source.Container}}docker_container {{ $.source.Container }} {{end}}
-</record>
+    {{range $key, $value := $.container}}
+    {{ $key }} {{ $value }}
+    {{end}}
+  </record>
 </filter>
 {{end}}

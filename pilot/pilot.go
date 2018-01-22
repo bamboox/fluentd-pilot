@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
+	"path"
+	"github.com/docker/docker/api/types/mount"
 )
 
 /**
@@ -27,9 +30,12 @@ aliyun.log: /var/log/hello.log[:json][;/var/log/abc/def.log[:txt]]
 const LABEL_SERVICE_LOGS = "aliyun.logs."
 const ENV_SERVICE_LOGS = "aliyun_logs_"
 const FLUENTD_CONF_HOME = "/etc/fluentd"
+const SYMLINK_LOGS_BASE = "/acs/log/"
 
 const LABEL_PROJECT = "com.docker.compose.project"
+const LABEL_PROJECT_SWARM_MODE = "com.docker.stack.namespace"
 const LABEL_SERVICE = "com.docker.compose.service"
+const LABEL_SERVICE_SWARM_MODE = "com.docker.swarm.service.name"
 const LABEL_POD = "io.kubernetes.pod.name"
 
 type Pilot struct {
@@ -37,7 +43,8 @@ type Pilot struct {
 	tpl          *template.Template
 	base         string
 	dockerClient *client.Client
-	reloadable   bool
+	reloadChan   chan bool
+	lastReload   time.Time
 }
 
 func New(tplStr string, baseDir string) (*Pilot, error) {
@@ -59,17 +66,23 @@ func New(tplStr string, baseDir string) (*Pilot, error) {
 		dockerClient: client,
 		tpl:          tpl,
 		base:         baseDir,
+		reloadChan:   make(chan bool),
 	}, nil
 }
 
 func (p *Pilot) watch() error {
 
-	p.reloadable = false
 	if err := p.processAllContainers(); err != nil {
 		return err
 	}
-	StartFluentd()
-	p.reloadable = true
+
+	err := StartFluentd()
+	if err != nil && ERR_ALREADY_STARTED != err.Error() {
+		return err
+	}
+
+	p.lastReload = time.Now()
+	go p.doReload()
 
 	ctx := context.Background()
 	filter := filters.NewArgs()
@@ -96,13 +109,6 @@ func (p *Pilot) watch() error {
 	}
 }
 
-type Source struct {
-	Application string
-	Service     string
-	POD         string
-	Container   string
-}
-
 type LogConfig struct {
 	Name         string
 	HostDir      string
@@ -112,6 +118,7 @@ type LogConfig struct {
 	File         string
 	Tags         map[string]string
 	Target       string
+	TimeKey      string
 }
 
 func (p *Pilot) cleanConfigs() error {
@@ -146,7 +153,7 @@ func (p *Pilot) processAllContainers() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	opts := types.ContainerListOptions{All: true}
+	opts := types.ContainerListOptions{}
 	containers, err := p.client().ContainerList(context.Background(), opts)
 	if err != nil {
 		return err
@@ -157,20 +164,102 @@ func (p *Pilot) processAllContainers() error {
 		return err
 	}
 
+	containerIDs := make(map[string]string, 0)
 	for _, c := range containers {
+		if _, ok := containerIDs[c.ID]; !ok {
+			containerIDs[c.ID] = c.ID
+		}
+		if c.State == "removing" {
+			continue
+		}
 		containerJSON, err := p.client().ContainerInspect(context.Background(), c.ID)
 		if err != nil {
 			return err
 		}
-		if err = p.newContainer(containerJSON); err != nil {
+		if err = p.newContainer(&containerJSON); err != nil {
 			log.Errorf("fail to process container %s: %v", containerJSON.Name, err)
 		}
 	}
+	return p.processAllVolumeSymlink(containerIDs)
+}
 
+func (p *Pilot) processAllVolumeSymlink(existingContainerIDs map[string]string) error {
+	symlinkContainerIDs := p.listAllSymlinkContainer()
+	for containerID := range symlinkContainerIDs {
+		if _, ok := existingContainerIDs[containerID]; !ok {
+			p.removeVolumeSymlink(containerID)
+		}
+	}
 	return nil
 }
 
-func (p *Pilot) newContainer(containerJSON types.ContainerJSON) error {
+func (p *Pilot) listAllSymlinkContainer() map[string]string {
+	containerIDs := make(map[string]string, 0)
+	linkBaseDir := path.Join(p.base, SYMLINK_LOGS_BASE)
+	if _, err := os.Stat(linkBaseDir); err != nil && os.IsNotExist(err) {
+		return containerIDs
+	}
+
+	projects := listSubDirectory(linkBaseDir)
+	for _, project := range projects {
+		projectPath := path.Join(linkBaseDir, project)
+		services := listSubDirectory(projectPath)
+		for _, service := range services {
+			servicePath := path.Join(projectPath, service)
+			containers := listSubDirectory(servicePath)
+			for _, containerID := range containers {
+				if _, ok := containerIDs[containerID]; !ok {
+					containerIDs[containerID] = containerID
+				}
+			}
+		}
+	}
+	return containerIDs
+}
+
+func listSubDirectory(path string) []string {
+	subdirs := make([]string, 0)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return subdirs
+	}
+
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		log.Warnf("read %s error: %v", path, err)
+		return subdirs
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			subdirs = append(subdirs, file.Name())
+		}
+	}
+	return subdirs
+}
+
+func putIfNotEmpty(store map[string]string, key, value string) {
+	if key == "" || value == "" {
+		return
+	}
+
+	store[key] = value
+}
+
+func container(containerJSON *types.ContainerJSON) map[string]string {
+	labels := containerJSON.Config.Labels
+	c := make(map[string]string)
+	putIfNotEmpty(c, "docker_app", labels[LABEL_PROJECT])
+	putIfNotEmpty(c, "docker_app", labels[LABEL_PROJECT_SWARM_MODE])
+	putIfNotEmpty(c, "docker_service", labels[LABEL_SERVICE])
+	putIfNotEmpty(c, "docker_service", labels[LABEL_SERVICE_SWARM_MODE])
+	putIfNotEmpty(c, "k8s_pod", labels[LABEL_POD])
+	putIfNotEmpty(c, "docker_container", strings.TrimPrefix(containerJSON.Name, "/"))
+	extension(c, containerJSON)
+
+	return c
+}
+
+func (p *Pilot) newContainer(containerJSON *types.ContainerJSON) error {
 	id := containerJSON.ID
 	jsonLogPath := containerJSON.LogPath
 	mounts := containerJSON.Mounts
@@ -179,30 +268,24 @@ func (p *Pilot) newContainer(containerJSON types.ContainerJSON) error {
 
 	//logConfig.containerDir match types.mountPoint
 	/**
-	场景：
-	1. 容器一个路径，中间有多级目录对应宿主机不同的目录
-	2. containerdir对应的目录不是直接挂载的，挂载的是它上级的目录
+	  场景：
+	  1. 容器一个路径，中间有多级目录对应宿主机不同的目录
+	  2. containerdir对应的目录不是直接挂载的，挂载的是它上级的目录
 
-	查找：从containerdir开始查找最近的一层挂载
+	  查找：从containerdir开始查找最近的一层挂载
 	*/
 
-	source := Source{
-		Application: labels[LABEL_PROJECT],
-		Service:     labels[LABEL_SERVICE],
-		POD:         labels[LABEL_POD],
-		Container:   strings.TrimPrefix(containerJSON.Name, "/"),
-	}
+	container := container(containerJSON)
 
 	for _, e := range env {
 		if !strings.HasPrefix(e, ENV_SERVICE_LOGS) {
 			continue
 		}
-		envLabel := strings.Split(e, "=")
+		envLabel := strings.SplitN(e, "=", 2)
 		if len(envLabel) == 2 {
 			labelKey := strings.Replace(envLabel[0], "_", ".", -1)
 			labels[labelKey] = envLabel[1]
 		}
-
 	}
 
 	logConfigs, err := p.getLogConfigs(jsonLogPath, mounts, labels)
@@ -215,14 +298,17 @@ func (p *Pilot) newContainer(containerJSON types.ContainerJSON) error {
 		return nil
 	}
 
+	// create symlink
+	p.createVolumeSymlink(containerJSON)
+
 	//pilot.findMounts(logConfigs, jsonLogPath, mounts)
 	//生成配置
-	fluentdConfig, err := p.render(id, source, logConfigs)
+	fluentdConfig, err := p.render(id, container, logConfigs)
 	if err != nil {
 		return err
 	}
 	//TODO validate config before save
-	//log.Infof("Save %s to %s", fluentdConfig, p.pathOf(id))
+	//log.Debugf("container %s fluentd config: %s", id, fluentdConfig)
 	if err = ioutil.WriteFile(p.pathOf(id), []byte(fluentdConfig), os.FileMode(0644)); err != nil {
 		return err
 	}
@@ -231,8 +317,18 @@ func (p *Pilot) newContainer(containerJSON types.ContainerJSON) error {
 }
 
 func (p *Pilot) tryReload() {
-	if p.reloadable {
-		ReloadFluentd()
+	select {
+	case p.reloadChan <- true:
+	default:
+		log.Info("Another load is pending")
+	}
+}
+
+func (p *Pilot) doReload() {
+	log.Info("Reload gorouting is ready")
+	for {
+		<-p.reloadChan
+		p.reload()
 	}
 }
 
@@ -240,13 +336,16 @@ func (p *Pilot) pathOf(container string) string {
 	return fmt.Sprintf("%s/conf.d/%s.conf", FLUENTD_CONF_HOME, container)
 }
 
-func (p *Pilot) delContainer(id string) error {
-	log.Infof("Try remove config %s", id)
-	if err := os.Remove(p.pathOf(id)); err != nil {
-		return err
+func (p *Pilot) delContainer(id string) func() {
+	return func() {
+		log.Infof("Try remove config %s", id)
+		p.removeVolumeSymlink(id)
+		if err := os.Remove(p.pathOf(id)); err != nil {
+			log.Errorf("%s is already exists.", id)
+			return
+		}
+		p.tryReload()
 	}
-	p.tryReload()
-	return nil
 }
 
 func (p *Pilot) client() *client.Client {
@@ -257,7 +356,7 @@ func (p *Pilot) processEvent(msg events.Message) error {
 	containerId := msg.Actor.ID
 	ctx := context.Background()
 	switch msg.Action {
-	case "start":
+	case "start", "restart":
 		log.Debugf("Process container start event: %s", containerId)
 		if p.exists(containerId) {
 			log.Debugf("%s is already exists.", containerId)
@@ -267,10 +366,10 @@ func (p *Pilot) processEvent(msg events.Message) error {
 		if err != nil {
 			return err
 		}
-		return p.newContainer(containerJSON)
+		return p.newContainer(&containerJSON)
 	case "destroy":
 		log.Debugf("Process container destory event: %s", containerId)
-		p.delContainer(containerId)
+		time.AfterFunc(15*time.Minute, p.delContainer(containerId))
 	}
 	return nil
 }
@@ -334,6 +433,11 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 
 	target := info.get("target")
 
+	timeKey := info.get("time_key")
+	if timeKey == "" {
+		timeKey = "@timestamp"
+	}
+
 	if path == "stdout" {
 		return &LogConfig{
 			Name:         name,
@@ -343,6 +447,7 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 			Tags:         tagMap,
 			FormatConfig: map[string]string{"time_format": "%Y-%m-%dT%H:%M:%S.%NZ"},
 			Target:       target,
+			TimeKey:      timeKey,
 		}, nil
 	}
 
@@ -385,6 +490,7 @@ func (p *Pilot) parseLogConfig(name string, info *LogInfoNode, jsonLogPath strin
 		HostDir:      filepath.Join(p.base, hostDir),
 		FormatConfig: formatConfig,
 		Target:       target,
+		TimeKey:      timeKey,
 	}, nil
 }
 
@@ -468,14 +574,17 @@ func (p *Pilot) exists(containId string) bool {
 	return true
 }
 
-func (p *Pilot) render(containerId string, source Source, configList []*LogConfig) (string, error) {
-	log.Infof("logs: %v", configList)
-	var buf bytes.Buffer
+func (p *Pilot) render(containerId string, container map[string]string, configList []*LogConfig) (string, error) {
+	for _, config := range configList {
+		log.Infof("logs: %s = %v", containerId, config)
+	}
 
+	var buf bytes.Buffer
 	context := map[string]interface{}{
-		"containerId": containerId,
-		"configList":  configList,
-		"source":      source,
+		"containerId":   containerId,
+		"configList":    configList,
+		"container":     container,
+		"fluentdOutput": os.Getenv("FLUENTD_OUTPUT"),
 	}
 	if err := p.tpl.Execute(&buf, context); err != nil {
 		return "", err
@@ -484,8 +593,78 @@ func (p *Pilot) render(containerId string, source Source, configList []*LogConfi
 }
 
 func (p *Pilot) reload() error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
 	log.Info("Reload fluentd")
-	return ReloadFluentd()
+	interval := time.Now().Sub(p.lastReload)
+	time.Sleep(30*time.Second - interval)
+	log.Info("Start reloading")
+	err := ReloadFluentd()
+	p.lastReload = time.Now()
+	return err
+}
+
+func (p *Pilot) createVolumeSymlink(containerJSON *types.ContainerJSON) error {
+	linkBaseDir := path.Join(p.base, SYMLINK_LOGS_BASE)
+	if _, err := os.Stat(linkBaseDir); err != nil && os.IsNotExist(err) {
+		if err := os.MkdirAll(linkBaseDir, 0777); err != nil {
+			log.Errorf("create %s error: %v", linkBaseDir, err)
+		}
+	}
+
+	applicationInfo := container(containerJSON)
+	containerLinkBaseDir := path.Join(linkBaseDir, applicationInfo["docker_app"],
+		applicationInfo["docker_service"], containerJSON.ID)
+	symlinks := make(map[string]string, 0)
+	for _, mountPoint := range containerJSON.Mounts {
+		if mountPoint.Type != mount.TypeVolume {
+			continue
+		}
+
+		volume, err := p.client().VolumeInspect(context.Background(), mountPoint.Name)
+		if err != nil {
+			log.Errorf("inspect volume %s error: %v", mountPoint.Name, err)
+			continue
+		}
+
+		symlink := path.Join(containerLinkBaseDir, volume.Name)
+		if _, ok := symlinks[volume.Mountpoint]; !ok {
+			symlinks[volume.Mountpoint] = symlink
+		}
+	}
+
+	if len(symlinks) == 0 {
+		return nil
+	}
+
+	if _, err := os.Stat(containerLinkBaseDir); err != nil && os.IsNotExist(err) {
+		if err := os.MkdirAll(containerLinkBaseDir, 0777); err != nil {
+			log.Errorf("create %s error: %v", containerLinkBaseDir, err)
+			return err
+		}
+	}
+
+	for mountPoint, symlink := range symlinks {
+		err := os.Symlink(mountPoint, symlink)
+		if err != nil && !os.IsExist(err) {
+			log.Errorf("create symlink %s error: %v", symlink, err)
+		}
+	}
+	return nil
+}
+
+func (p *Pilot) removeVolumeSymlink(containerId string) error {
+	linkBaseDir := path.Join(p.base, SYMLINK_LOGS_BASE)
+	containerLinkDirs, _ := filepath.Glob(path.Join(linkBaseDir, "*", "*", containerId))
+	if containerLinkDirs == nil {
+		return nil
+	}
+	for _, containerLinkDir := range containerLinkDirs {
+		if err := os.RemoveAll(containerLinkDir); err != nil {
+			log.Warnf("remove error: %v", err)
+		}
+	}
+	return nil
 }
 
 func Run(tpl string, baseDir string) error {
