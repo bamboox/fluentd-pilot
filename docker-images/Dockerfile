@@ -20,7 +20,7 @@ COPY plugins/ /etc/fluentd/plugins/
 
 VOLUME /etc/fluentd/conf.d
 
-COPY pilot fluentd.tpl entrypoint config.default /pilot/
+COPY pilot fluentd.tpl entrypoint config.default healthcheck.sh /pilot/
 VOLUME /pilot/pos
 
 EXPOSE 24224
